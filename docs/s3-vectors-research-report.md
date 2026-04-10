@@ -437,9 +437,228 @@ Milvus 同样适合多租户，但更偏向“平台工程”思路：
 | 多租户治理 | 存储层容易，检索层难 | 较自然 | 可做，但需要平台治理 |
 | 最适合的数据温度 | 冷 | 温 / 冷 | 热 / 温 |
 
-### 2.4 三者的优势与劣势
+### 2.4 为什么 Milvus 底层也是对象存储，但 S3 Vectors 仍然更低成本
 
-#### 2.4.1 纯对象存储
+这是一个非常关键的理解点。很多人第一次看到 Milvus 架构时会觉得：
+
+> Milvus 底层也把数据放在对象存储里，那为什么 S3 Vectors 会更便宜？
+
+答案是：
+
+> **底层落在对象存储，并不等于整个系统的成本结构接近对象存储。**
+
+两者的差异不在“最终数据写到哪里”，而在“为了完成查询，系统还要长期维持什么样的计算、缓存、索引和调度能力”。
+
+#### 2.4.1 Milvus 的对象存储是持久层，不是全部成本
+
+Milvus 的官方架构采用存算分离。对象存储在其中承担的是：
+
+- 日志快照和历史数据持久化
+- 向量索引与标量索引文件保存
+- 中间结果和历史 segment 保存
+
+但为了提供数据库级检索能力，Milvus 还需要：
+
+- Query Node 承担在线查询
+- Data Node 承担 compaction、flush、index build 等任务
+- 协调组件管理调度与元数据
+- 缓存层和内存层承接热点 segment 与索引
+- WAL、元数据服务和集群资源保障高可用
+
+换句话说，**对象存储只是 Milvus 的低成本持久层，真正让它“像数据库一样工作”的，是额外的引擎层和常驻资源层。**
+
+#### 2.4.2 Milvus 的成本来自数据库能力，而不只是存储容量
+
+Milvus 更贵，通常不是因为“对象存储更贵”，而是因为它提供了更强的能力，而这些能力需要更多资源：
+
+- 更低延迟
+- 更高 QPS
+- 更复杂的标量过滤
+- dense + sparse hybrid retrieval
+- 多向量字段搜索
+- 更细的索引和查询调优
+
+这些能力的代价是：
+
+- 查询节点常驻计算成本
+- 热点数据与索引的内存占用
+- 索引构建与 compaction 成本
+- 集群扩缩容和高可用治理成本
+
+也就是说，你付费买到的是 **“数据库能力”**，而不仅仅是“向量最终存在哪”。
+
+#### 2.4.3 S3 Vectors 低成本的核心是少维护一整层数据库引擎
+
+S3 Vectors 的产品定位更克制。它并不追求把自己做成一个高性能向量数据库，而是：
+
+- 把向量存储和基础 ANN 查询下沉到 S3 服务层
+- 优先优化海量向量的长期保留
+- 优先服务低频或中频的语义查询
+- 避免用户单独维护一套数据库级向量检索集群
+
+因此，S3 Vectors 的低成本来自几个方面：
+
+- 不需要用户单独维护常驻的查询节点和数据节点
+- 不需要用户自己承担数据库级高可用和扩缩容复杂度
+- 不以高 QPS、极低延迟和复杂混合检索为主要目标
+- 能力面更聚焦，因此资源模型也更轻
+
+这也是为什么 AWS 官方会明确把 S3 Vectors 定位在“低频查询优化”，并建议把更高 QPS、更复杂检索交给 OpenSearch 这类热层系统。
+
+#### 2.4.4 本质区别：对象存储做持久层，和对象存储原生提供向量查询，不是一回事
+
+可以把两者理解成两种完全不同的系统边界：
+
+- **Milvus**：对象存储是数据库后端的一部分，数据库系统负责把对象存储上的数据变成低延迟可查询服务。
+- **S3 Vectors**：对象存储服务本身直接提供向量存储与基础查询能力。
+
+这两种方式都可以“把数据放在对象存储上”，但它们的成本结构完全不同：
+
+- 前者为数据库性能和复杂能力买单
+- 后者为存储原生能力和基础查询买单
+
+#### 2.4.5 什么时候这种低成本优势最明显
+
+S3 Vectors 的低成本优势并不是在所有场景下都绝对成立，而是在以下前提下最明显：
+
+- 向量数量极大
+- 需要长期保留
+- 查询存在，但不是高频高并发
+- 可以接受亚秒级而非极致毫秒级体验
+- 业务更关注总拥有成本，而不是最强搜索功能
+
+如果业务目标换成以下方向：
+
+- 高频低延迟检索
+- 复杂 hybrid retrieval
+- 高并发在线搜索
+- 搜索效果调优是核心竞争力
+
+那么 Milvus 更高的成本往往是合理的，因为你买到的是更强的在线检索能力，而不是单纯存储。
+
+### 2.5 这里提到的 OpenSearch 到底是什么
+
+在本报告的语境中，提到的 OpenSearch 主要指的是：
+
+- **OpenSearch**：开源搜索与分析引擎
+- **Amazon OpenSearch Service**：AWS 托管版 OpenSearch
+- **OpenSearch Serverless**：AWS 提供的无服务器形态，其中包含专门的 vector search collection
+
+也就是说，这里并不是泛指“任意搜索系统”，而是在讨论 AWS 官方推荐的、与 S3 Vectors 配合使用的 **搜索热层 / 检索引擎层**。
+
+#### 2.5.1 OpenSearch 的本质是搜索引擎，不只是向量库
+
+OpenSearch 最初是典型的搜索与分析引擎，擅长：
+
+- 全文检索
+- 倒排索引
+- 过滤
+- 聚合
+- 排序
+- 实时搜索 API
+
+后来 OpenSearch 增加了向量搜索能力，因此它现在既能做：
+
+- 关键词搜索
+- 向量相似搜索
+- 关键词 + 向量混合搜索
+
+AWS 官方文档中，OpenSearch Service 的向量搜索支持 `knn_vector` 字段、k-NN / approximate k-NN 查询以及多种距离度量。OpenSearch Serverless 的 vector search collection 还明确支持：
+
+- full-text search
+- advanced filtering
+- aggregations
+- geospatial queries
+- nested queries
+
+这说明 OpenSearch 的定位不是“只会搜向量”，而是 **把向量检索纳入搜索引擎能力体系**。
+
+#### 2.5.2 为什么 S3 Vectors 讨论里会出现 OpenSearch
+
+原因很简单：AWS 官方并不把 S3 Vectors 定位成一个全面的高性能搜索引擎。
+
+S3 Vectors 更偏向：
+
+- 低成本
+- 超大规模
+- 长期保存
+- 基础向量查询
+- 低频或中频检索
+
+而 OpenSearch 更偏向：
+
+- 更高吞吐
+- 更低延迟
+- 更复杂过滤
+- 混合搜索
+- 聚合和分析
+- 更接近用户前台体验的搜索服务
+
+因此在 AWS 推荐架构里，这两者通常不是替代关系，而是分层关系：
+
+- **S3 Vectors** 承担低成本向量底座
+- **OpenSearch** 承担高性能、复杂查询和搜索前台能力
+
+#### 2.5.3 OpenSearch 在架构里一般扮演什么角色
+
+在 S3 Vectors 相关架构中，OpenSearch 通常扮演 **热层搜索引擎** 或 **在线检索层**。
+
+一种典型分层方式是：
+
+1. 原始文件放在普通 S3
+2. embedding 长期保存在 S3 Vectors
+3. 热点数据或高价值数据导入 OpenSearch
+4. 前台搜索、RAG 在线召回、复杂过滤和混合检索都走 OpenSearch
+
+这种做法的好处是：
+
+- 长期存储成本由 S3 Vectors 控制
+- 前台搜索性能和能力由 OpenSearch 提供
+- 形成冷温热分层，而不是让一个系统承担所有目标
+
+#### 2.5.4 AWS 官方是如何把两者连起来的
+
+AWS 官方文档提供了从 **Amazon S3 Vectors 导入 OpenSearch Serverless** 的方案，底层通过 **OpenSearch Ingestion** 管道把向量从 S3 vector index 导入到 OpenSearch Serverless 的 vector collection 中。
+
+需要注意的一点是：
+
+- 导入后，数据仍然保留在 S3 vector index 中
+- 也就是说，OpenSearch 热层和 S3 Vectors 底层通常会同时存在
+
+这恰恰反映了官方推荐的分工：
+
+- S3 Vectors 负责长期、低成本、可查的向量底座
+- OpenSearch 负责高性能和复杂检索
+
+#### 2.5.5 OpenSearch 和 Milvus 的区别
+
+虽然 OpenSearch 和 Milvus 都可以承担“热检索层”，但它们属于不同路线：
+
+- **Milvus**：更纯粹的向量数据库路线，重点在向量检索能力本身
+- **OpenSearch**：搜索引擎路线，重点是把向量检索和全文检索、过滤、聚合、搜索运营能力放在一起
+
+如果业务更像：
+
+- 站内搜索
+- 商品搜索
+- 内容搜索
+- 关键词 + 向量混合检索
+- 搜索分析和运营
+
+那么 OpenSearch 往往更自然。
+
+如果业务更像：
+
+- 纯向量召回
+- 多向量字段 ANN 检索
+- 向量数据库能力优先
+- 检索链路围绕 embedding 本身设计
+
+那么 Milvus 更典型。
+
+### 2.6 三者的优势与劣势
+
+#### 2.6.1 纯对象存储
 
 #### 优势
 
@@ -454,7 +673,7 @@ Milvus 同样适合多租户，但更偏向“平台工程”思路：
 - 在线搜索能力几乎全部要自建
 - 元数据过滤、权限、召回质量都需要额外系统配合
 
-#### 2.4.2 S3 Vectors
+#### 2.6.2 S3 Vectors
 
 #### 优势
 
@@ -469,7 +688,7 @@ Milvus 同样适合多租户，但更偏向“平台工程”思路：
 - 不以高 QPS、极低延迟在线检索为主要目标
 - 更复杂的 hybrid retrieval 和搜索前台能力要靠外部系统补齐
 
-#### 2.4.3 Milvus
+#### 2.6.3 Milvus
 
 #### 优势
 
@@ -484,7 +703,7 @@ Milvus 同样适合多租户，但更偏向“平台工程”思路：
 - 总体资源和长期持有成本通常高于对象存储型方案
 - 如果只是承载大量低频冷向量，性价比不一定高
 
-### 2.5 选型建议
+### 2.7 选型建议
 
 如果只看一句话：
 
@@ -980,3 +1199,15 @@ S3 Vectors 最适合的定位是：
 
 24. Milvus Tiered Storage Overview  
     https://milvus.io/docs/tiered-storage-overview.md
+
+25. What is Amazon OpenSearch Service  
+    https://docs.aws.amazon.com/opensearch-service/latest/developerguide/what-is.html
+
+26. Vector search in Amazon OpenSearch Service  
+    https://docs.aws.amazon.com/opensearch-service/latest/developerguide/vector-search.html
+
+27. Working with vector search collections in OpenSearch Serverless  
+    https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-vector-search.html
+
+28. Import from Amazon S3 Vectors to OpenSearch Serverless  
+    https://docs.aws.amazon.com/opensearch-service/latest/developerguide/s3-opensearch-vector-bucket-integration.html
